@@ -412,6 +412,32 @@ jobs:
           echo "Building LLVM for target: ${{matrix.target}}"
           echo "Source directory: $ROOTDIR"
           echo "Build directory: ${TARGET_BUILD_DIR}"
+          
+          # 为 musl 环境添加必要的编译标志
+          # 1. 定义 _LARGEFILE64_SOURCE 以启用 64 位文件操作
+          # 2. 定义 _GNU_SOURCE 以获得完整的 GNU 扩展
+          # 3. 定义 _FILE_OFFSET_BITS=64 以使用 64 位文件偏移
+          # 4. 禁用某些特定的警告
+          MUSL_CFLAGS="-static -D_LARGEFILE64_SOURCE -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64"
+          MUSL_CXXFLAGS="$MUSL_CFLAGS"
+          
+          # 修改 raw_ostream.cpp 中的 lseek64 调用
+          echo "Patching raw_ostream.cpp for musl compatibility..."
+          RAW_OSTREAM_FILE="$ROOTDIR/llvm/lib/Support/raw_ostream.cpp"
+          if [ -f "$RAW_OSTREAM_FILE" ]; then
+            # 备份原始文件
+            cp "$RAW_OSTREAM_FILE" "$RAW_OSTREAM_FILE.bak"
+            
+            # 将 lseek64 替换为 lseek（musl 中通常使用 lseek）
+            sed -i 's/::lseek64/::lseek/g' "$RAW_OSTREAM_FILE"
+            
+            echo "  Patched lseek64 to lseek in raw_ostream.cpp"
+          else
+            echo "  WARNING: raw_ostream.cpp not found!"
+          fi
+          
+          # 还需要检查其他可能使用 lseek64 的文件
+          find "$ROOTDIR/llvm" -name "*.cpp" -o -name "*.c" -o -name "*.h" | xargs grep -l "lseek64" 2>/dev/null || true
 
           cmake -S "$ROOTDIR/llvm" -B "${TARGET_BUILD_DIR}" -G Ninja \
             -DCMAKE_INSTALL_PREFIX="${ROOTDIR}/llvm-${{matrix.target}}" \
@@ -429,8 +455,8 @@ jobs:
             -DCMAKE_AR="${TOOLCHAIN}/bin/ar" \
             -DCMAKE_RANLIB="${TOOLCHAIN}/bin/ranlib" \
             -DCMAKE_STRIP="${TOOLCHAIN}/bin/strip" \
-            -DCMAKE_C_FLAGS="-static" \
-            -DCMAKE_CXX_FLAGS="-static" \
+            -DCMAKE_C_FLAGS="$MUSL_CFLAGS" \
+            -DCMAKE_CXX_FLAGS="$MUSL_CXXFLAGS" \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
             -DLLVM_ENABLE_PROJECTS="${{inputs.projects}}" \
             -DLLVM_ENABLE_ZLIB=FORCE_ON \
