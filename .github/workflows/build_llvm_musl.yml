@@ -84,11 +84,25 @@ jobs:
           cd $ROOTDIR/llvm-project-full
           
           echo "Checking out LLVM revision: $LLVM_REV"
-          git checkout --quiet $LLVM_REV || {
-            echo "Warning: Could not checkout $LLVM_REV directly, fetching..."
-            git fetch --quiet origin $LLVM_REV
-            git checkout --quiet $LLVM_REV
-          }
+          # 尝试多种方式检出
+          if ! git checkout --quiet $LLVM_REV 2>/dev/null; then
+            echo "Fetching revision $LLVM_REV..."
+            git fetch --quiet origin $LLVM_REV 2>/dev/null || true
+            if git rev-parse --verify $LLVM_REV >/dev/null 2>&1; then
+              git checkout --quiet $LLVM_REV
+            else
+              # 如果特定的提交不存在，尝试使用标签
+              echo "Revision $LLVM_REV not found, trying tags..."
+              TAG=$(git tag --list "*$LLVM_VERSION*" | head -1)
+              if [ -n "$TAG" ]; then
+                echo "Checking out tag: $TAG"
+                git checkout --quiet $TAG
+              else
+                echo "ERROR: Could not find LLVM revision $LLVM_REV or version $LLVM_VERSION"
+                exit 1
+              fi
+            fi
+          fi
           
           # 克隆 llvm_android 仓库
           echo "Cloning llvm_android at commit $ANDROID_REV..."
@@ -105,6 +119,28 @@ jobs:
           PATCH_FAILURES="$ROOTDIR/patch_failures.log"
           > "$PATCH_FAILURES"
           
+          # 函数：清理冲突标记
+          clean_conflict_markers() {
+            echo "Cleaning conflict markers in source files..."
+            find . -type f \( -name "*.h" -o -name "*.cpp" -o -name "*.c" -o -name "*.cc" -o -name "*.hpp" -o -name "*.inc" -o -name "*.def" -o -name "*.td" \) \
+              -exec grep -l "<<<<<<<" {} \; 2>/dev/null | while read file; do
+              echo "  Cleaning: $file"
+              # 删除冲突标记和相关内容
+              sed -i -e '/^<<<<<<< /,/^=======$/d' -e '/^>>>>>>> /d' "$file"
+            done
+            
+            # 特别检查已知有问题的文件
+            if [ -f "llvm/include/llvm/ADT/Triple.h" ]; then
+              echo "  Special cleaning: llvm/include/llvm/ADT/Triple.h"
+              # 备份
+              cp "llvm/include/llvm/ADT/Triple.h" "llvm/include/llvm/ADT/Triple.h.bak"
+              # 删除冲突标记
+              sed -i '/^<<<<<<< /d' "llvm/include/llvm/ADT/Triple.h"
+              sed -i '/^=======$/d' "llvm/include/llvm/ADT/Triple.h"
+              sed -i '/^>>>>>>> /d' "llvm/include/llvm/ADT/Triple.h"
+            fi
+          }
+          
           # 函数：尝试应用补丁
           apply_patch() {
             local patch_file="$1"
@@ -120,15 +156,32 @@ jobs:
               fi
             fi
             
-            # 如果 git apply 失败，尝试 patch 命令
+            # 如果 git apply 失败，尝试 patch 命令（不使用 --merge）
             echo "  ℹ git apply failed, trying patch command..."
-            if patch -p1 < "$patch_file" --merge --verbose --no-backup-if-mismatch 2>&1 | tee -a "$PATCH_FAILURES.tmp"; then
+            # 先备份可能被修改的文件
+            PATCH_TMP="$ROOTDIR/patch_tmp_$patch_name"
+            cp "$patch_file" "$PATCH_TMP"
+            
+            # 尝试应用补丁，如果失败则记录
+            if patch -p1 < "$patch_file" --forward --quiet --no-backup-if-mismatch 2>&1; then
               echo "  ✓ Applied successfully with patch command"
+              rm -f "$PATCH_TMP"
               return 0
             else
               echo "  ✗ Failed to apply patch: $patch_name" | tee -a "$PATCH_FAILURES"
-              # 尝试使用 --reject 选项保存拒绝的文件
-              patch -p1 < "$patch_file" --reject --verbose --no-backup-if-mismatch 2>&1 || true
+              
+              # 尝试使用 reject 模式
+              echo "  ℹ Trying with reject mode..."
+              if patch -p1 < "$patch_file" --reject --quiet --no-backup-if-mismatch 2>&1; then
+                echo "  ⚠ Applied with rejections, cleaning up reject files..."
+                find . -name "*.rej" -delete 2>/dev/null || true
+                # 清理可能产生的冲突标记
+                clean_conflict_markers
+              else
+                echo "  ✗ Completely failed to apply patch"
+              fi
+              
+              rm -f "$PATCH_TMP"
               return 1
             fi
           }
@@ -151,6 +204,9 @@ jobs:
             done
           fi
           
+          # 清理冲突标记
+          clean_conflict_markers
+          
           # 应用自定义补丁（musl）
           if [ -d "$ROOTDIR/patches/musl/llvm/$LLVM_VERSION" ]; then
             echo "Applying musl patches..."
@@ -171,11 +227,35 @@ jobs:
             done
           fi
           
+          # 最终清理冲突标记
+          clean_conflict_markers
+          
           # 检查是否有补丁失败
           if [ -s "$PATCH_FAILURES" ]; then
             echo "Warning: Some patches failed to apply:"
             cat "$PATCH_FAILURES"
             echo "Continuing build, but this may cause issues..."
+          fi
+          
+          # 检查关键文件是否包含冲突标记
+          echo "Checking for remaining conflict markers..."
+          CONFLICT_FILES=$(grep -r "<<<<<<<" . --include="*.h" --include="*.cpp" --include="*.c" --include="*.cc" --include="*.hpp" 2>/dev/null | head -10 || true)
+          if [ -n "$CONFLICT_FILES" ]; then
+            echo "ERROR: Found conflict markers in files:"
+            echo "$CONFLICT_FILES"
+            echo "Attempting to clean them..."
+            # 再次清理
+            find . -type f \( -name "*.h" -o -name "*.cpp" -o -name "*.c" -o -name "*.cc" -o -name "*.hpp" \) \
+              -exec sed -i '/^<<<<<<< /d;/^=======$/d;/^>>>>>>> /d' {} \;
+          fi
+          
+          # 验证关键文件
+          if [ -f "llvm/include/llvm/ADT/Triple.h" ]; then
+            echo "Checking Triple.h for conflicts..."
+            if grep -q "<<<<<<<" "llvm/include/llvm/ADT/Triple.h"; then
+              echo "WARNING: Triple.h still has conflict markers, forcing cleanup..."
+              sed -i '/^<<<<<<< /d;/^=======$/d;/^>>>>>>> /d' "llvm/include/llvm/ADT/Triple.h"
+            fi
           fi
           
           # 清理 llvm_android 目录
@@ -186,12 +266,14 @@ jobs:
           rm -rf "$ROOTDIR/llvm"
           cp -r "$ROOTDIR/llvm-project-full"/* "$ROOTDIR/"
           
-          echo "All patches applied (with possible warnings)."
+          echo "All patches applied and conflict markers cleaned."
           
-          # 检查关键文件是否存在
-          echo "Verifying source files..."
-          ls -la "$ROOTDIR/llvm" || true
-          ls -la "$ROOTDIR/clang" || true
+          # 最终验证
+          echo "Final verification..."
+          if grep -r "<<<<<<<" "$ROOTDIR/llvm" --include="*.h" 2>/dev/null | head -5; then
+            echo "ERROR: Still found conflict markers after cleanup!"
+            exit 1
+          fi
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2.0.5
@@ -260,7 +342,7 @@ jobs:
                       "${ROOTDIR}/zstd/lib/compress/zstd_fast.c" \
                       "${ROOTDIR}/zstd/lib/compress/zstd_compress_literals.c" \
                       "${ROOTDIR}/zstd/lib/compress/zstd_double_fast.c" \
-                      "${ROOTDIR}/zstd/lib/compress/huf_compress.c" \
+                      "${ROOTDAR}/zstd/lib/compress/huf_compress.c" \
                       "${ROOTDIR}/zstd/lib/compress/fse_compress.c" \
                       "${ROOTDIR}/zstd/lib/compress/zstd_lazy.c" \
                       "${ROOTDIR}/zstd/lib/compress/zstd_compress.c" \
@@ -288,6 +370,13 @@ jobs:
 
       - name: Build LLVM
         run: |
+          # 在构建前再次检查冲突标记
+          echo "Pre-build check for conflict markers..."
+          if grep -r "<<<<<<<" "$ROOTDIR/llvm/include/llvm/ADT/Triple.h" 2>/dev/null; then
+            echo "ERROR: Triple.h still has conflict markers! Manually fixing..."
+            sed -i '/^<<<<<<< /d;/^=======$/d;/^>>>>>>> /d' "$ROOTDIR/llvm/include/llvm/ADT/Triple.h"
+          fi
+          
           TOOLCHAIN=${PWD}/zig-as-llvm
           
           # 确认源代码目录存在
