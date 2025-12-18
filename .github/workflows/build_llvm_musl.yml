@@ -125,7 +125,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y ninja-build cmake g++ gcc
+          sudo apt install -y ninja-build cmake g++ gcc python3
 
       - name: Build dependencies
         run: |
@@ -206,16 +206,17 @@ jobs:
               )
           fi
 
-      - name: Build host tools (llvm-tblgen)
+      - name: Build host tools (x86_64)
         run: |
-          # 先构建主机工具 (x86_64)
-          echo "Building host tools (llvm-tblgen)..."
+          # 构建主机工具 (x86_64)，用于交叉编译
+          echo "Building host tools (x86_64) for cross-compilation..."
           mkdir -p "${HOST_BUILD_DIR}"
           
-          # 使用系统编译器构建主机工具
+          # 使用系统编译器构建完整的主机工具
           cmake -S "$ROOTDIR/llvm-project/llvm" -B "${HOST_BUILD_DIR}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_ENABLE_PROJECTS="" \
+            -DCMAKE_INSTALL_PREFIX="${HOST_BUILD_DIR}/install" \
+            -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra;lld" \
             -DLLVM_TARGETS_TO_BUILD="X86" \
             -DLLVM_BUILD_TOOLS=ON \
             -DLLVM_BUILD_UTILS=ON \
@@ -230,22 +231,39 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DLLVM_BUILD_LLVM_DYLIB=OFF \
             -DLLVM_LINK_LLVM_DYLIB=OFF \
-            -DLLVM_OPTIMIZED_TABLEGEN=ON
+            -DLLVM_OPTIMIZED_TABLEGEN=ON \
+            -DCLANG_BUILD_TOOLS=ON \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DCLANG_BUILD_EXAMPLES=OFF \
+            -DLLVM_BUILD_RUNTIME=ON
           
-          # 只构建需要的表生成器工具
-          cmake --build "${HOST_BUILD_DIR}" --target llvm-tblgen clang-tblgen lld-tblgen -j$(nproc)
+          # 构建所有主机工具
+          cmake --build "${HOST_BUILD_DIR}" --target install -j$(nproc)
           
-          # 验证工具已构建
+          # 验证主机工具已构建
           echo "Host tools built:"
-          ls -la "${HOST_BUILD_DIR}/bin/"
+          ls -la "${HOST_BUILD_DIR}/install/bin/"
+          
+          # 检查关键工具是否存在
+          if [ -f "${HOST_BUILD_DIR}/install/bin/llvm-tblgen" ] && \
+             [ -f "${HOST_BUILD_DIR}/install/bin/clang-tblgen" ] && \
+             [ -f "${HOST_BUILD_DIR}/install/bin/llvm-config" ] && \
+             [ -f "${HOST_BUILD_DIR}/install/bin/clang-ast-dump" ]; then
+            echo "✓ All required host tools built successfully"
+          else
+            echo "✗ Some required host tools are missing"
+            exit 1
+          fi
 
-      - name: Build LLVM
+      - name: Build LLVM for target
         run: |
           TOOLCHAIN=${PWD}/zig-as-llvm
           
           echo "Building LLVM for target: ${{matrix.target}}"
           echo "Source directory: $ROOTDIR/llvm-project/llvm"
           echo "Build directory: ${TARGET_BUILD_DIR}"
+          echo "Using host tools from: ${HOST_BUILD_DIR}/install/bin"
           
           # 为 musl 环境添加必要的编译标志
           MUSL_CFLAGS="-static -D_LARGEFILE64_SOURCE -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64"
@@ -319,36 +337,74 @@ jobs:
             -DCLANG_REPOSITORY_STRING="https://github.com/${{ github.repository_owner }}/llvm-custom" \
             -DPACKAGE_BUGREPORT="https://github.com/${{ github.repository_owner }}/android-ndk-custom/issues/" \
             -DLLVM_LIBDIR_SUFFIX=64 \
-            # 关键：使用主机构建的表生成器
-            -DLLVM_TABLEGEN="${HOST_BUILD_DIR}/bin/llvm-tblgen" \
-            -DCLANG_TABLEGEN="${HOST_BUILD_DIR}/bin/clang-tblgen" \
-            -DLLVM_CONFIG_PATH="${HOST_BUILD_DIR}/bin/llvm-config"
+            -DLLVM_BUILD_RUNTIME=ON \
+            -DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF \
+            -DLLVM_ENABLE_RUNTIMES="compiler-rt;libcxx;libcxxabi;libunwind" \
+            # 关键：使用主机构建的工具
+            -DLLVM_TABLEGEN="${HOST_BUILD_DIR}/install/bin/llvm-tblgen" \
+            -DCLANG_TABLEGEN="${HOST_BUILD_DIR}/install/bin/clang-tblgen" \
+            -DLLVM_CONFIG_PATH="${HOST_BUILD_DIR}/install/bin/llvm-config" \
+            -DCLANG_LLD_AVAILABLE=ON \
+            -DLLVM_TOOL_CLANG_AST_DUMP_BUILD=ON \
+            -DLLVM_TOOL_CLANG_AST_DUMP_EXE="${HOST_BUILD_DIR}/install/bin/clang-ast-dump"
 
+          # 先构建LLVM核心部分
           cmake --build "${TARGET_BUILD_DIR}" --target install -j$(nproc)
 
-      - name: Check
+          # 构建运行时库（compiler-rt, libcxx等）
+          echo "Building runtime libraries..."
+          cmake --build "${TARGET_BUILD_DIR}" --target runtimes -j$(nproc)
+          
+          # 安装运行时库
+          echo "Installing runtime libraries..."
+          cmake --build "${TARGET_BUILD_DIR}" --target install-runtimes
+
+      - name: Check build
         run: |
           if [ -d "llvm-${{matrix.target}}" ]; then
             echo "=== Binaries ==="
-            file llvm-${{matrix.target}}/bin/* || true
-            echo "=== Library directories ==="
+            ls -la llvm-${{matrix.target}}/bin/ | head -20
+            echo "=== Runtime libraries ==="
             ls -la llvm-${{matrix.target}}/lib* || true
+            find llvm-${{matrix.target}}/lib* -name "*.a" -o -name "*.so" 2>/dev/null | head -20
             echo "=== Install directory structure ==="
-            tree -L 2 llvm-${{matrix.target}} || true
+            tree -L 3 llvm-${{matrix.target}} || ls -laR llvm-${{matrix.target}} | head -100
           else
             echo "Build directory not found, checking build directory..."
             ls -la build/
             ls -la build/aarch64-linux-musl/ || true
           fi
 
+      - name: Test key binaries
+        run: |
+          if [ -d "llvm-${{matrix.target}}" ]; then
+            echo "Testing key binaries..."
+            # 测试 clang
+            if [ -f "llvm-${{matrix.target}}/bin/clang" ]; then
+              echo "Testing clang version:"
+              file "llvm-${{matrix.target}}/bin/clang"
+              echo "Clang built successfully"
+            fi
+            # 测试 lld
+            if [ -f "llvm-${{matrix.target}}/bin/ld.lld" ]; then
+              echo "Testing lld:"
+              file "llvm-${{matrix.target}}/bin/ld.lld"
+            fi
+            # 检查运行时库
+            echo "Checking runtime libraries:"
+            find "llvm-${{matrix.target}}" -name "libclang_rt*" -o -name "libc++*" -o -name "libunwind*" 2>/dev/null | head -10
+          fi
+
       - name: Compress
         run: |
           if [ -d "llvm-${{matrix.target}}" ]; then
-            projects="clang+clang-tools-extra+lld"
+            projects="clang+clang-tools-extra+lld+runtimes"
             tarball_name=${projects}-r${{inputs.version}}${{inputs.revision}}-${{matrix.target}}
             echo tarball_name=${tarball_name} >> ${GITHUB_ENV}
             mv llvm-${{matrix.target}} ${tarball_name}
             tar -c ${tarball_name} | xz -T0 -v >${tarball_name}.tar.xz
+            echo "Archive created: ${tarball_name}.tar.xz"
+            ls -lh ${tarball_name}.tar.xz
           else
             echo "ERROR: llvm-${{matrix.target}} directory not found!"
             exit 1
@@ -361,4 +417,7 @@ jobs:
           artifacts: ${{env.tarball_name}}.tar.xz
           allowUpdates: true
           replacesArtifacts: true
-          body: ''
+          body: |
+            LLVM toolchain built for ${{matrix.target}} with musl libc.
+            Includes: clang, clang-tools-extra, lld, and runtime libraries.
+            Built from NDK r${{inputs.version}}${{inputs.revision}}.
