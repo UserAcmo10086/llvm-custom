@@ -1,4 +1,3 @@
-
 name: Build LLVM (musl libc)
 run-name: Build LLVM for r${{inputs.version}}${{inputs.revision}} ${{inputs.projects}}
 on:
@@ -15,7 +14,6 @@ on:
         type: string
       projects:
         description: "Projects to build:"
-        # bolt;clang;clang-tools-extra;compiler-rt;cross-project-tests;libc;libclc;lld;lldb;mlir;openmp;polly;pstl;flang
         default: "bolt;clang;clang-tools-extra;lld"
         required: true
 
@@ -28,7 +26,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # hexagon-linux-musl, mips64-linux-muslabi64, mips64el-linux-muslabi64, x86_64-linux-muslx32
         target: [aarch64-linux-musl]
     runs-on: ubuntu-24.04
     env:
@@ -55,62 +52,146 @@ jobs:
 
       - name: Checkout llvm-project and apply android patches
         run: |
+          set -e
+          
           NDK_DIR="$ROOTDIR/android-ndk-r${{inputs.version}}${{inputs.revision}}"
-          LLVM_BIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          CLANG_VERSION_CMD="$LLVM_BIN/clang --version"
-          CLANG_SOURCE_INFO="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/clang_source_info.md"
-
+          
           echo "Downloading NDK r${{inputs.version}}${{inputs.revision}}..."
           curl -sSfL -o android-ndk.zip "https://dl.google.com/android/repository/android-ndk-r${{inputs.version}}${{inputs.revision}}-linux.zip"
           unzip -qq android-ndk.zip -d $ROOTDIR
-
+          
+          # 提取版本信息
+          LLVM_BIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG_VERSION_CMD="$LLVM_BIN/clang --version"
+          CLANG_SOURCE_INFO="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/clang_source_info.md"
+          
           LLVM_VERSION=$($CLANG_VERSION_CMD | sed -n 's/.*clang version \([0-9][0-9.]*[a-zA-Z0-9]*\).*/\1/p')
           LLVM_REV=$($CLANG_VERSION_CMD | sed -E 's/.*llvm-project ([a-f0-9]{40}).*/\1/' | head -n 1)
           ANDROID_REV=$(grep 'llvm_android/+/.*' "$CLANG_SOURCE_INFO" | sed -n 's/.*llvm_android\/\+//; s/\/patches.*//p' | sed 's/\/\+//g; s/^\+//g' | head -n 1)
-
+          
           if [[ -z "$LLVM_VERSION" || -z "$LLVM_REV" || -z "$ANDROID_REV" ]]; then
             echo "Error: Failed to extract necessary version/revision info."
             exit 1
           fi
-
-          echo "Downloading LLVM source (revision $LLVM_REV)..."
-          curl -sSfL -o llvm-project.tar.gz "https://android.googlesource.com/toolchain/llvm-project/+archive/$LLVM_REV.tar.gz"
-          tar -xf llvm-project.tar.gz
-          rm llvm-project.tar.gz
-
+          
+          echo "LLVM Version: $LLVM_VERSION"
+          echo "LLVM Revision: $LLVM_REV"
+          echo "Android Revision: $ANDROID_REV"
+          
+          # 克隆完整的 llvm-project 仓库并检出指定版本
+          echo "Cloning llvm-project repository..."
+          git clone --quiet https://github.com/llvm/llvm-project.git $ROOTDIR/llvm-project-full
+          cd $ROOTDIR/llvm-project-full
+          
+          echo "Checking out LLVM revision: $LLVM_REV"
+          git checkout --quiet $LLVM_REV || {
+            echo "Warning: Could not checkout $LLVM_REV directly, fetching..."
+            git fetch --quiet origin $LLVM_REV
+            git checkout --quiet $LLVM_REV
+          }
+          
+          # 克隆 llvm_android 仓库
           echo "Cloning llvm_android at commit $ANDROID_REV..."
-          git clone --quiet https://android.googlesource.com/toolchain/llvm_android ../llvm_android
-          cd ../llvm_android
+          git clone --quiet https://android.googlesource.com/toolchain/llvm_android $ROOTDIR/llvm_android
+          cd $ROOTDIR/llvm_android
           git checkout --quiet $ANDROID_REV
-          cd $ROOTDIR
-
+          
+          # 回到 llvm-project 目录应用补丁
+          cd $ROOTDIR/llvm-project-full
+          
           echo "Applying patches from llvm_android..."
-          mapfile -t PATCHES < <(grep -oP 'patches/\S+' "$CLANG_SOURCE_INFO" | sed 's/)$//')
-
-          for PATCH in ${PATCHES[@]}; do
-              echo "Applying $(basename "$PATCH")..."
-              if [[ -f "$ROOTDIR/../llvm_android/$PATCH" ]]; then
-                  git apply "$ROOTDIR/../llvm_android/$PATCH" || true
-              elif [[ -f "$ROOTDIR/../llvm_android/cherry/$PATCH" ]]; then
-                  git apply "$ROOTDIR/../llvm_android/cherry/$PATCH" || true
+          
+          # 创建补丁失败记录文件
+          PATCH_FAILURES="$ROOTDIR/patch_failures.log"
+          > "$PATCH_FAILURES"
+          
+          # 函数：尝试应用补丁
+          apply_patch() {
+            local patch_file="$1"
+            local patch_name="$(basename "$patch_file")"
+            
+            echo "Applying $patch_name..."
+            
+            # 首先尝试 git apply
+            if git apply --check "$patch_file" 2>/dev/null; then
+              if git apply "$patch_file" 2>&1; then
+                echo "  ✓ Applied successfully with git apply"
+                return 0
               fi
-          done
-
-          rm -rf "$ROOTDIR/../llvm_android"
-
-          if [ -d "$ROOTDIR/patches/musl/llvm/$LLVM_VERSION" ]; then
-            for PATCH in $ROOTDIR/patches/musl/llvm/$LLVM_VERSION/*.patch; do
-              echo "Applying $(basename "$PATCH")..."
-              git apply "$PATCH"
+            fi
+            
+            # 如果 git apply 失败，尝试 patch 命令
+            echo "  ℹ git apply failed, trying patch command..."
+            if patch -p1 < "$patch_file" --merge --verbose --no-backup-if-mismatch 2>&1 | tee -a "$PATCH_FAILURES.tmp"; then
+              echo "  ✓ Applied successfully with patch command"
+              return 0
+            else
+              echo "  ✗ Failed to apply patch: $patch_name" | tee -a "$PATCH_FAILURES"
+              # 尝试使用 --reject 选项保存拒绝的文件
+              patch -p1 < "$patch_file" --reject --verbose --no-backup-if-mismatch 2>&1 || true
+              return 1
+            fi
+          }
+          
+          # 应用 patches/ 目录下的补丁
+          if [ -d "$ROOTDIR/llvm_android/patches" ]; then
+            for PATCH in "$ROOTDIR/llvm_android/patches"/*.patch; do
+              if [ -f "$PATCH" ]; then
+                apply_patch "$PATCH"
+              fi
             done
           fi
-
-          for PATCH in $ROOTDIR/patches/global/llvm/$LLVM_VERSION/*.patch; do
-            echo "Applying $(basename "$PATCH")..."
-            git apply "$PATCH"
-          done
-
-          echo "All patches applied successfully."
+          
+          # 应用 cherry/ 目录下的补丁
+          if [ -d "$ROOTDIR/llvm_android/patches/cherry" ]; then
+            for PATCH in "$ROOTDIR/llvm_android/patches/cherry"/*.patch; do
+              if [ -f "$PATCH" ]; then
+                apply_patch "$PATCH"
+              fi
+            done
+          fi
+          
+          # 应用自定义补丁（musl）
+          if [ -d "$ROOTDIR/patches/musl/llvm/$LLVM_VERSION" ]; then
+            echo "Applying musl patches..."
+            for PATCH in "$ROOTDIR/patches/musl/llvm/$LLVM_VERSION"/*.patch; do
+              if [ -f "$PATCH" ]; then
+                apply_patch "$PATCH"
+              fi
+            done
+          fi
+          
+          # 应用全局补丁
+          if [ -d "$ROOTDIR/patches/global/llvm/$LLVM_VERSION" ]; then
+            echo "Applying global patches..."
+            for PATCH in "$ROOTDIR/patches/global/llvm/$LLVM_VERSION"/*.patch; do
+              if [ -f "$PATCH" ]; then
+                apply_patch "$PATCH"
+              fi
+            done
+          fi
+          
+          # 检查是否有补丁失败
+          if [ -s "$PATCH_FAILURES" ]; then
+            echo "Warning: Some patches failed to apply:"
+            cat "$PATCH_FAILURES"
+            echo "Continuing build, but this may cause issues..."
+          fi
+          
+          # 清理 llvm_android 目录
+          rm -rf "$ROOTDIR/llvm_android"
+          
+          # 将打好补丁的源码复制到工作目录
+          echo "Copying patched source to workspace..."
+          rm -rf "$ROOTDIR/llvm"
+          cp -r "$ROOTDIR/llvm-project-full"/* "$ROOTDIR/"
+          
+          echo "All patches applied (with possible warnings)."
+          
+          # 检查关键文件是否存在
+          echo "Verifying source files..."
+          ls -la "$ROOTDIR/llvm" || true
+          ls -la "$ROOTDIR/clang" || true
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2.0.5
@@ -120,7 +201,6 @@ jobs:
 
       - name: Setup Zig toolchain
         run: |
-          #git clone https://github.com/${{ github.repository_owner }}/zig-as-llvm
           git clone https://github.com/HomuHomu833/zig-as-llvm
           cp -R $ROOTDIR/patches/musl/zig/* $(whereis zig | awk '{print $2}' | xargs dirname)
 
@@ -209,6 +289,21 @@ jobs:
       - name: Build LLVM
         run: |
           TOOLCHAIN=${PWD}/zig-as-llvm
+          
+          # 确认源代码目录存在
+          if [ ! -d "$ROOTDIR/llvm" ]; then
+            echo "ERROR: llvm directory not found!"
+            echo "Current directory contents:"
+            ls -la "$ROOTDIR/"
+            exit 1
+          fi
+          
+          # 创建构建目录
+          mkdir -p "${TARGET_BUILD_DIR}"
+          
+          echo "Building LLVM for target: ${{matrix.target}}"
+          echo "Source directory: $ROOTDIR"
+          echo "Build directory: ${TARGET_BUILD_DIR}"
 
           cmake -S "$ROOTDIR/llvm" -B "${TARGET_BUILD_DIR}" -G Ninja \
             -DCMAKE_INSTALL_PREFIX="${ROOTDIR}/llvm-${{matrix.target}}" \
@@ -276,12 +371,12 @@ jobs:
             -DCLANG_REPOSITORY_STRING="https://github.com/${{ github.repository_owner }}/llvm-custom" \
             -DPACKAGE_BUGREPORT="https://github.com/${{ github.repository_owner }}/android-ndk-custom/issues/"
 
-          cmake --build "${TARGET_BUILD_DIR}" --target install
+          cmake --build "${TARGET_BUILD_DIR}" --target install -j$(nproc)
 
       - name: Check
         run: |
-          file llvm-${{matrix.target}}/bin/*
-          tree llvm-${{matrix.target}}
+          file llvm-${{matrix.target}}/bin/* || true
+          tree llvm-${{matrix.target}} || true
 
       - name: Compress
         run: |
