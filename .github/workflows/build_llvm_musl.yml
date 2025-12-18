@@ -78,9 +78,9 @@ jobs:
           
           # 克隆完整的 llvm-project 仓库并检出指定版本
           echo "Cloning llvm-project repository..."
-          git clone --quiet https://github.com/llvm/llvm-project.git $ROOTDIR/llvm
+          git clone --quiet https://github.com/llvm/llvm-project.git $ROOTDIR/llvm-project
           
-          cd $ROOTDIR/llvm
+          cd $ROOTDIR/llvm-project
           
           echo "Checking out LLVM revision: $LLVM_REV"
           # 尝试多种方式检出
@@ -104,6 +104,13 @@ jobs:
           fi
           
           echo "LLVM source ready at commit: $(git rev-parse HEAD)"
+          
+          # 检查目录结构
+          echo "Checking directory structure..."
+          ls -la $ROOTDIR/llvm-project/
+          
+          # 清理 NDK 目录以节省空间
+          rm -rf "$NDK_DIR"
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2.0.5
@@ -203,18 +210,45 @@ jobs:
         run: |
           TOOLCHAIN=${PWD}/zig-as-llvm
           
-          # 确认源代码目录存在
-          if [ ! -d "$ROOTDIR/llvm" ]; then
-            echo "ERROR: llvm directory not found!"
-            ls -la "$ROOTDIR/"
+          # 检查 llvm-project 目录结构
+          echo "Checking llvm-project directory structure..."
+          ls -la $ROOTDIR/llvm-project/
+          
+          # 查找 CMakeLists.txt 的正确位置
+          CMAKE_SOURCE_DIR="$ROOTDIR/llvm-project"
+          if [ -f "$CMAKE_SOURCE_DIR/CMakeLists.txt" ]; then
+            echo "Found CMakeLists.txt at $CMAKE_SOURCE_DIR/CMakeLists.txt"
+          elif [ -f "$CMAKE_SOURCE_DIR/llvm/CMakeLists.txt" ]; then
+            echo "Found CMakeLists.txt at $CMAKE_SOURCE_DIR/llvm/CMakeLists.txt"
+            # 设置正确的项目子目录
+            CMAKE_SOURCE_DIR="$CMAKE_SOURCE_DIR/llvm"
+          else
+            echo "ERROR: CMakeLists.txt not found!"
+            find $ROOTDIR/llvm-project -name "CMakeLists.txt" | head -10
             exit 1
           fi
+          
+          # 查找 raw_ostream.cpp
+          RAW_OSTREAM_PATHS=(
+            "$ROOTDIR/llvm-project/llvm/lib/Support/raw_ostream.cpp"
+            "$ROOTDIR/llvm-project/llvm/llvm/lib/Support/raw_ostream.cpp"
+            "$ROOTDIR/llvm-project/lib/Support/raw_ostream.cpp"
+          )
+          
+          RAW_OSTREAM_FILE=""
+          for path in "${RAW_OSTREAM_PATHS[@]}"; do
+            if [ -f "$path" ]; then
+              RAW_OSTREAM_FILE="$path"
+              echo "Found raw_ostream.cpp at: $RAW_OSTREAM_FILE"
+              break
+            fi
+          done
           
           # 创建构建目录
           mkdir -p "${TARGET_BUILD_DIR}"
           
           echo "Building LLVM for target: ${{matrix.target}}"
-          echo "Source directory: $ROOTDIR"
+          echo "Source directory: $CMAKE_SOURCE_DIR"
           echo "Build directory: ${TARGET_BUILD_DIR}"
           
           # 为 musl 环境添加必要的编译标志
@@ -222,9 +256,8 @@ jobs:
           MUSL_CXXFLAGS="$MUSL_CFLAGS"
           
           # 修复 musl 兼容性问题：将 lseek64 替换为 lseek
-          echo "Patching raw_ostream.cpp for musl compatibility..."
-          RAW_OSTREAM_FILE="$ROOTDIR/llvm/lib/Support/raw_ostream.cpp"
-          if [ -f "$RAW_OSTREAM_FILE" ]; then
+          if [ -n "$RAW_OSTREAM_FILE" ]; then
+            echo "Patching raw_ostream.cpp for musl compatibility..."
             # 备份原始文件
             cp "$RAW_OSTREAM_FILE" "$RAW_OSTREAM_FILE.bak"
             
@@ -233,17 +266,28 @@ jobs:
             
             echo "  Patched lseek64 to lseek in raw_ostream.cpp"
           else
-            echo "  WARNING: raw_ostream.cpp not found!"
+            echo "  WARNING: raw_ostream.cpp not found! Searching..."
+            find "$ROOTDIR/llvm-project" -name "raw_ostream.cpp" 2>/dev/null | head -5
           fi
           
           # 检查并修复其他可能使用 lseek64 的文件
           echo "Checking for other lseek64 usage..."
-          find "$ROOTDIR/llvm" -name "*.cpp" -o -name "*.c" -o -name "*.h" | xargs grep -l "lseek64" 2>/dev/null | while read file; do
+          find "$ROOTDIR/llvm-project" -name "*.cpp" -o -name "*.c" -o -name "*.h" | xargs grep -l "lseek64" 2>/dev/null | while read file; do
             echo "  Patching: $file"
             sed -i 's/lseek64/lseek/g' "$file"
           done || true
 
-          cmake -S "$ROOTDIR/llvm" -B "${TARGET_BUILD_DIR}" -G Ninja \
+          # 设置项目列表，移除 flang 如果不在默认构建中
+          PROJECTS="${{inputs.projects}}"
+          # 检查 flang 是否存在，如果不存在则从构建列表中移除
+          if [[ ! -d "$ROOTDIR/llvm-project/flang" ]] && [[ "$PROJECTS" == *"flang"* ]]; then
+            echo "Flang not found in source tree, removing from build list"
+            PROJECTS=$(echo "$PROJECTS" | sed 's/;flang;/;/g' | sed 's/flang;//g' | sed 's/;flang$//g' | sed 's/^flang;//g')
+          fi
+          
+          echo "Building projects: $PROJECTS"
+
+          cmake -S "$CMAKE_SOURCE_DIR" -B "${TARGET_BUILD_DIR}" -G Ninja \
             -DCMAKE_INSTALL_PREFIX="${ROOTDIR}/llvm-${{matrix.target}}" \
             -DCMAKE_PREFIX_PATH="${TARGET_INSTALL_DIR}" \
             -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM;RISCV" \
@@ -262,7 +306,7 @@ jobs:
             -DCMAKE_C_FLAGS="$MUSL_CFLAGS" \
             -DCMAKE_CXX_FLAGS="$MUSL_CXXFLAGS" \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
-            -DLLVM_ENABLE_PROJECTS="${{inputs.projects}}" \
+            -DLLVM_ENABLE_PROJECTS="$PROJECTS" \
             -DLLVM_ENABLE_ZLIB=FORCE_ON \
             -DLLVM_ENABLE_ZSTD=FORCE_ON \
             -DLLVM_USE_STATIC_ZSTD=ON \
@@ -313,16 +357,27 @@ jobs:
 
       - name: Check
         run: |
-          file llvm-${{matrix.target}}/bin/* || true
-          tree llvm-${{matrix.target}} || true
+          if [ -d "llvm-${{matrix.target}}" ]; then
+            file llvm-${{matrix.target}}/bin/* || true
+            tree llvm-${{matrix.target}} || true
+          else
+            echo "Build directory not found, checking build directory..."
+            ls -la build/
+            ls -la build/aarch64-linux-musl/ || true
+          fi
 
       - name: Compress
         run: |
-          projects=$(echo "${{inputs.projects}}" | tr ";" "+")
-          tarball_name=${projects}-r${{inputs.version}}${{inputs.revision}}-${{matrix.target}}
-          echo tarball_name=${tarball_name} >> ${GITHUB_ENV}
-          mv llvm-${{matrix.target}} ${tarball_name}
-          tar -c ${tarball_name} | xz -T0 -v >${tarball_name}.tar.xz
+          if [ -d "llvm-${{matrix.target}}" ]; then
+            projects=$(echo "${{inputs.projects}}" | tr ";" "+")
+            tarball_name=${projects}-r${{inputs.version}}${{inputs.revision}}-${{matrix.target}}
+            echo tarball_name=${tarball_name} >> ${GITHUB_ENV}
+            mv llvm-${{matrix.target}} ${tarball_name}
+            tar -c ${tarball_name} | xz -T0 -v >${tarball_name}.tar.xz
+          else
+            echo "ERROR: llvm-${{matrix.target}} directory not found!"
+            exit 1
+          fi
 
       - name: Upload release
         uses: ncipollo/release-action@v1.20.0
