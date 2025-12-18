@@ -351,7 +351,11 @@ jobs:
             -DLLVM_VERSION_SUFFIX="" \
             -DCLANG_VENDOR="Android" \
             -DCLANG_REPOSITORY_STRING="https://github.com/${{ github.repository_owner }}/llvm-custom" \
-            -DPACKAGE_BUGREPORT="https://github.com/${{ github.repository_owner }}/android-ndk-custom/issues/"
+            -DPACKAGE_BUGREPORT="https://github.com/${{ github.repository_owner }}/android-ndk-custom/issues/" \
+            # 禁用 Bolt 运行时，避免 macOS 目标构建失败
+            -DBOLT_BUILD_RUNTIME=OFF \
+            # 禁用 Bolt 测试
+            -DBOLT_BUILD_TESTS=OFF
 
           cmake --build "${TARGET_BUILD_DIR}" --target install -j$(nproc)
 
