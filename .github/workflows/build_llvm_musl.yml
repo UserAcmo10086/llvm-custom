@@ -50,9 +50,9 @@ jobs:
         with:
           path: ${{github.workspace}}
 
-      - name: Checkout llvm-project and apply android patches
+      - name: Checkout llvm-project
         run: |
-          # 注意：这里移除了 set -e，以便在补丁失败时继续执行
+          set -e
           
           NDK_DIR="$ROOTDIR/android-ndk-r${{inputs.version}}${{inputs.revision}}"
           
@@ -67,21 +67,20 @@ jobs:
           
           LLVM_VERSION=$($CLANG_VERSION_CMD | sed -n 's/.*clang version \([0-9][0-9.]*[a-zA-Z0-9]*\).*/\1/p')
           LLVM_REV=$($CLANG_VERSION_CMD | sed -E 's/.*llvm-project ([a-f0-9]{40}).*/\1/' | head -n 1)
-          ANDROID_REV=$(grep 'llvm_android/+/.*' "$CLANG_SOURCE_INFO" | sed -n 's/.*llvm_android\/\+//; s/\/patches.*//p' | sed 's/\/\+//g; s/^\+//g' | head -n 1)
           
-          if [[ -z "$LLVM_VERSION" || -z "$LLVM_REV" || -z "$ANDROID_REV" ]]; then
+          if [[ -z "$LLVM_VERSION" || -z "$LLVM_REV" ]]; then
             echo "Error: Failed to extract necessary version/revision info."
             exit 1
           fi
           
           echo "LLVM Version: $LLVM_VERSION"
           echo "LLVM Revision: $LLVM_REV"
-          echo "Android Revision: $ANDROID_REV"
           
           # 克隆完整的 llvm-project 仓库并检出指定版本
           echo "Cloning llvm-project repository..."
-          git clone --quiet https://github.com/llvm/llvm-project.git $ROOTDIR/llvm-project-full
-          cd $ROOTDIR/llvm-project-full
+          git clone --quiet https://github.com/llvm/llvm-project.git $ROOTDIR/llvm
+          
+          cd $ROOTDIR/llvm
           
           echo "Checking out LLVM revision: $LLVM_REV"
           # 尝试多种方式检出
@@ -104,196 +103,7 @@ jobs:
             fi
           fi
           
-          # 克隆 llvm_android 仓库
-          echo "Cloning llvm_android at commit $ANDROID_REV..."
-          git clone --quiet https://android.googlesource.com/toolchain/llvm_android $ROOTDIR/llvm_android
-          cd $ROOTDIR/llvm_android
-          git checkout --quiet $ANDROID_REV
-          
-          # 回到 llvm-project 目录应用补丁
-          cd $ROOTDIR/llvm-project-full
-          
-          echo "Applying patches from llvm_android..."
-          
-          # 创建补丁失败记录文件
-          PATCH_FAILURES="$ROOTDIR/patch_failures.log"
-          > "$PATCH_FAILURES"
-          
-          # 定义已知有问题的补丁列表（从之前的错误中收集）
-          PROBLEMATIC_PATCHES=(
-            # 第一次出现的失败补丁
-            "fc0aa8424ca98da29a9c7aa15b4427d47504ba87.patch"
-            "b0343a38a5910e980bb031e4014655d77cd0c162.patch"
-            
-            # 第二次出现的失败补丁
-            "Revert-two-changes-that-break-Android-builds.v6.patch"
-            "Revert-two-changes-that-break-Android-builds.v7.patch"
-            
-            # 第三次出现的失败补丁
-            "Revert-Sema-Introduce-BuiltinAttr-per-declaration-bu.v4.patch"
-            
-            # 新出现的失败补丁
-            "078279ff017f799d9cb8fe515808fcc518fe0c41.patch"
-            
-            # 可能还有其他变体
-            "*Revert-*"
-            "*fc0aa8424*"
-            "*b0343a38a*"
-          )
-          
-          # 函数：检查是否是问题补丁
-          is_problematic_patch() {
-            local patch_name="$1"
-            for pattern in "${PROBLEMATIC_PATCHES[@]}"; do
-              if [[ "$patch_name" == $pattern ]] || [[ "$patch_name" == *"$pattern"* ]]; then
-                return 0  # 是问题补丁
-              fi
-            done
-            return 1  # 不是问题补丁
-          }
-          
-          # 函数：清理冲突标记
-          clean_conflict_markers() {
-            echo "Cleaning conflict markers in source files..."
-            find . -type f \( -name "*.h" -o -name "*.cpp" -o -name "*.c" -o -name "*.cc" -o -name "*.hpp" -o -name "*.inc" -o -name "*.def" -o -name "*.td" \) \
-              -exec grep -l "<<<<<<<" {} \; 2>/dev/null | while read file; do
-              echo "  Cleaning: $file"
-              # 删除冲突标记和相关内容
-              sed -i -e '/^<<<<<<< /,/^=======$/d' -e '/^>>>>>>> /d' "$file"
-            done
-            
-            # 特别检查已知有问题的文件
-            if [ -f "llvm/include/llvm/ADT/Triple.h" ]; then
-              echo "  Special cleaning: llvm/include/llvm/ADT/Triple.h"
-              # 备份
-              cp "llvm/include/llvm/ADT/Triple.h" "llvm/include/llvm/ADT/Triple.h.bak"
-              # 删除冲突标记
-              sed -i '/^<<<<<<< /d' "llvm/include/llvm/ADT/Triple.h"
-              sed -i '/^=======$/d' "llvm/include/llvm/ADT/Triple.h"
-              sed -i '/^>>>>>>> /d' "llvm/include/llvm/ADT/Triple.h"
-            fi
-          }
-          
-          # 函数：安全的补丁应用（不会因为失败而退出）
-          safe_apply_patch() {
-            local patch_file="$1"
-            local patch_name="$(basename "$patch_file")"
-            
-            # 检查是否是已知问题补丁
-            if is_problematic_patch "$patch_name"; then
-              echo "Skipping problematic patch: $patch_name"
-              echo "  ⚠ Known problematic patch, skipping to avoid build errors"
-              return 0
-            fi
-            
-            echo "Applying $patch_name..."
-            
-            # 尝试 git apply
-            if git apply --check "$patch_file" 2>/dev/null; then
-              if git apply "$patch_file" 2>&1; then
-                echo "  ✓ Applied successfully"
-                return 0
-              fi
-            fi
-            
-            # 尝试 patch 命令
-            echo "  ℹ git apply failed, trying patch command..."
-            
-            # 使用最简化的 patch 命令，避免复杂选项
-            if patch -p1 -f < "$patch_file" 2>&1; then
-              echo "  ✓ Applied successfully with patch"
-              return 0
-            else
-              echo "  ⚠ Failed to apply patch: $patch_name" | tee -a "$PATCH_FAILURES"
-              echo "  ⚠ Skipping this patch to continue build"
-              # 清理可能的 .rej 文件
-              find . -name "*.rej" -delete 2>/dev/null || true
-              return 0  # 注意：这里返回 0 而不是 1，以避免退出
-            fi
-          }
-          
-          # 应用 patches/ 目录下的补丁
-          if [ -d "$ROOTDIR/llvm_android/patches" ]; then
-            for PATCH in "$ROOTDIR/llvm_android/patches"/*.patch; do
-              if [ -f "$PATCH" ]; then
-                safe_apply_patch "$PATCH" || true
-              fi
-            done
-          fi
-          
-          # 应用 cherry/ 目录下的补丁
-          if [ -d "$ROOTDIR/llvm_android/patches/cherry" ]; then
-            for PATCH in "$ROOTDIR/llvm_android/patches/cherry"/*.patch; do
-              if [ -f "$PATCH" ]; then
-                safe_apply_patch "$PATCH" || true
-              fi
-            done
-          fi
-          
-          # 清理冲突标记
-          clean_conflict_markers
-          
-          # 应用自定义补丁（musl）
-          if [ -d "$ROOTDIR/patches/musl/llvm/$LLVM_VERSION" ]; then
-            echo "Applying musl patches..."
-            for PATCH in "$ROOTDIR/patches/musl/llvm/$LLVM_VERSION"/*.patch; do
-              if [ -f "$PATCH" ]; then
-                safe_apply_patch "$PATCH" || true
-              fi
-            done
-          fi
-          
-          # 应用全局补丁
-          if [ -d "$ROOTDIR/patches/global/llvm/$LLVM_VERSION" ]; then
-            echo "Applying global patches..."
-            for PATCH in "$ROOTDIR/patches/global/llvm/$LLVM_VERSION"/*.patch; do
-              if [ -f "$PATCH" ]; then
-                safe_apply_patch "$PATCH" || true
-              fi
-            done
-          fi
-          
-          # 最终清理冲突标记
-          clean_conflict_markers
-          
-          # 清理所有 .rej 文件
-          find . -name "*.rej" -delete 2>/dev/null || true
-          
-          # 检查是否有补丁失败
-          if [ -s "$PATCH_FAILURES" ]; then
-            echo "Summary of skipped/failed patches:"
-            cat "$PATCH_FAILURES"
-            echo "Build will continue with skipped patches..."
-          fi
-          
-          # 检查关键文件是否包含冲突标记
-          echo "Final check for conflict markers..."
-          CONFLICT_FILES=$(grep -r "<<<<<<<" . --include="*.h" --include="*.cpp" --include="*.c" --include="*.cc" --include="*.hpp" 2>/dev/null | head -5 || true)
-          if [ -n "$CONFLICT_FILES" ]; then
-            echo "Found remaining conflict markers, cleaning..."
-            find . -type f \( -name "*.h" -o -name "*.cpp" -o -name "*.c" -o -name "*.cc" -o -name "*.hpp" \) \
-              -exec sed -i '/^<<<<<<< /d;/^=======$/d;/^>>>>>>> /d' {} \;
-          fi
-          
-          # 验证关键文件
-          if [ -f "llvm/include/llvm/ADT/Triple.h" ]; then
-            echo "Checking Triple.h for conflicts..."
-            if grep -q "<<<<<<<" "llvm/include/llvm/ADT/Triple.h"; then
-              echo "Triple.h still has conflict markers, forcing cleanup..."
-              sed -i '/^<<<<<<< /d;/^=======$/d;/^>>>>>>> /d' "llvm/include/llvm/ADT/Triple.h"
-            fi
-          fi
-          
-          # 清理 llvm_android 目录
-          rm -rf "$ROOTDIR/llvm_android"
-          
-          # 将打好补丁的源码复制到工作目录
-          echo "Copying patched source to workspace..."
-          rm -rf "$ROOTDIR/llvm"
-          cp -r "$ROOTDIR/llvm-project-full"/* "$ROOTDIR/"
-          
-          echo "Patch application complete."
-          echo "Note: Some problematic patches were skipped to ensure build success."
+          echo "LLVM source ready at commit: $(git rev-parse HEAD)"
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2.0.5
@@ -304,13 +114,14 @@ jobs:
       - name: Setup Zig toolchain
         run: |
           git clone https://github.com/HomuHomu833/zig-as-llvm
+          # 复制 zig-as-llvm 的补丁到 zig 安装目录
           cp -R $ROOTDIR/patches/musl/zig/* $(whereis zig | awk '{print $2}' | xargs dirname)
 
       - name: Install dependencies
         run: sudo apt install -y ninja-build
 
       - name: Build dependencies
-        run : |
+        run: |
           TOOLCHAIN=${PWD}/zig-as-llvm
           export CC=${TOOLCHAIN}/bin/cc
           export CXX=${TOOLCHAIN}/bin/c++
@@ -390,13 +201,6 @@ jobs:
 
       - name: Build LLVM
         run: |
-          # 在构建前再次检查冲突标记
-          echo "Pre-build check for conflict markers..."
-          if grep -r "<<<<<<<" "$ROOTDIR/llvm/include/llvm/ADT/Triple.h" 2>/dev/null; then
-            echo "Found conflict markers in Triple.h, fixing..."
-            sed -i '/^<<<<<<< /d;/^=======$/d;/^>>>>>>> /d' "$ROOTDIR/llvm/include/llvm/ADT/Triple.h"
-          fi
-          
           TOOLCHAIN=${PWD}/zig-as-llvm
           
           # 确认源代码目录存在
@@ -414,14 +218,10 @@ jobs:
           echo "Build directory: ${TARGET_BUILD_DIR}"
           
           # 为 musl 环境添加必要的编译标志
-          # 1. 定义 _LARGEFILE64_SOURCE 以启用 64 位文件操作
-          # 2. 定义 _GNU_SOURCE 以获得完整的 GNU 扩展
-          # 3. 定义 _FILE_OFFSET_BITS=64 以使用 64 位文件偏移
-          # 4. 禁用某些特定的警告
           MUSL_CFLAGS="-static -D_LARGEFILE64_SOURCE -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64"
           MUSL_CXXFLAGS="$MUSL_CFLAGS"
           
-          # 修改 raw_ostream.cpp 中的 lseek64 调用
+          # 修复 musl 兼容性问题：将 lseek64 替换为 lseek
           echo "Patching raw_ostream.cpp for musl compatibility..."
           RAW_OSTREAM_FILE="$ROOTDIR/llvm/lib/Support/raw_ostream.cpp"
           if [ -f "$RAW_OSTREAM_FILE" ]; then
@@ -436,8 +236,12 @@ jobs:
             echo "  WARNING: raw_ostream.cpp not found!"
           fi
           
-          # 还需要检查其他可能使用 lseek64 的文件
-          find "$ROOTDIR/llvm" -name "*.cpp" -o -name "*.c" -o -name "*.h" | xargs grep -l "lseek64" 2>/dev/null || true
+          # 检查并修复其他可能使用 lseek64 的文件
+          echo "Checking for other lseek64 usage..."
+          find "$ROOTDIR/llvm" -name "*.cpp" -o -name "*.c" -o -name "*.h" | xargs grep -l "lseek64" 2>/dev/null | while read file; do
+            echo "  Patching: $file"
+            sed -i 's/lseek64/lseek/g' "$file"
+          done || true
 
           cmake -S "$ROOTDIR/llvm" -B "${TARGET_BUILD_DIR}" -G Ninja \
             -DCMAKE_INSTALL_PREFIX="${ROOTDIR}/llvm-${{matrix.target}}" \
