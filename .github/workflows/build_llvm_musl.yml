@@ -1,3 +1,4 @@
+
 name: Build LLVM (musl libc)
 run-name: Build LLVM for r${{inputs.version}}${{inputs.revision}} ${{inputs.projects}}
 on:
@@ -28,7 +29,7 @@ jobs:
       fail-fast: false
       matrix:
         # hexagon-linux-musl, mips64-linux-muslabi64, mips64el-linux-muslabi64, x86_64-linux-muslx32
-        target: [aarch64-linux-musl, aarch64_be-linux-musl, arm-linux-musleabi, arm-linux-musleabihf, armeb-linux-musleabi, armeb-linux-musleabihf, loongarch64-linux-musl, loongarch64-linux-muslsf, mips-linux-musleabi, mips-linux-musleabihf, mips64-linux-muslabin32, mips64el-linux-muslabin32, mipsel-linux-musleabi, mipsel-linux-musleabihf, powerpc-linux-musleabi, powerpc-linux-musleabihf, powerpc64-linux-musl, powerpc64le-linux-musl, riscv32-linux-musl, riscv64-linux-musl, s390x-linux-musl, thumb-linux-musleabi, thumb-linux-musleabihf, thumbeb-linux-musleabi, thumbeb-linux-musleabihf, x86-linux-musl, x86_64-linux-musl]
+        target: [aarch64-linux-musl]
     runs-on: ubuntu-24.04
     env:
       ROOTDIR: ${{github.workspace}}
@@ -119,7 +120,8 @@ jobs:
 
       - name: Setup Zig toolchain
         run: |
-          git clone https://github.com/${{ github.repository_owner }}/zig-as-llvm
+          #git clone https://github.com/${{ github.repository_owner }}/zig-as-llvm
+          git clone https://github.com/HomuHomu833/zig-as-llvm
           cp -R $ROOTDIR/patches/musl/zig/* $(whereis zig | awk '{print $2}' | xargs dirname)
 
       - name: Install dependencies
