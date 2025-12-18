@@ -32,6 +32,7 @@ jobs:
       ROOTDIR: ${{github.workspace}}
       TARGET_BUILD_DIR: ${{github.workspace}}/build/${{matrix.target}}
       TARGET_INSTALL_DIR: ${{github.workspace}}/output/${{matrix.target}}
+      HOST_BUILD_DIR: ${{github.workspace}}/build/host
       ZIG_TARGET: ${{matrix.target}}
     steps:
       - name: Maximize build space
@@ -122,7 +123,9 @@ jobs:
           fi
 
       - name: Install dependencies
-        run: sudo apt install -y ninja-build
+        run: |
+          sudo apt update
+          sudo apt install -y ninja-build cmake g++ gcc
 
       - name: Build dependencies
         run: |
@@ -203,15 +206,42 @@ jobs:
               )
           fi
 
+      - name: Build host tools (llvm-tblgen)
+        run: |
+          # 先构建主机工具 (x86_64)
+          echo "Building host tools (llvm-tblgen)..."
+          mkdir -p "${HOST_BUILD_DIR}"
+          
+          # 使用系统编译器构建主机工具
+          cmake -S "$ROOTDIR/llvm-project/llvm" -B "${HOST_BUILD_DIR}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="" \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
+            -DLLVM_BUILD_TOOLS=ON \
+            -DLLVM_BUILD_UTILS=ON \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_BUILD_TESTS=OFF \
+            -DLLVM_BUILD_EXAMPLES=OFF \
+            -DLLVM_BUILD_BENCHMARKS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLVM_BUILD_LLVM_DYLIB=OFF \
+            -DLLVM_LINK_LLVM_DYLIB=OFF \
+            -DLLVM_OPTIMIZED_TABLEGEN=ON
+          
+          # 只构建需要的表生成器工具
+          cmake --build "${HOST_BUILD_DIR}" --target llvm-tblgen clang-tblgen lld-tblgen -j$(nproc)
+          
+          # 验证工具已构建
+          echo "Host tools built:"
+          ls -la "${HOST_BUILD_DIR}/bin/"
+
       - name: Build LLVM
         run: |
           TOOLCHAIN=${PWD}/zig-as-llvm
-          
-          # 检查 llvm-project 目录结构
-          echo "Checking llvm-project directory structure..."
-          
-          # 创建构建目录
-          mkdir -p "${TARGET_BUILD_DIR}"
           
           echo "Building LLVM for target: ${{matrix.target}}"
           echo "Source directory: $ROOTDIR/llvm-project/llvm"
@@ -288,18 +318,23 @@ jobs:
             -DCLANG_VENDOR="Android" \
             -DCLANG_REPOSITORY_STRING="https://github.com/${{ github.repository_owner }}/llvm-custom" \
             -DPACKAGE_BUGREPORT="https://github.com/${{ github.repository_owner }}/android-ndk-custom/issues/" \
-            -DLLVM_LIBDIR_SUFFIX=64
+            -DLLVM_LIBDIR_SUFFIX=64 \
+            # 关键：使用主机构建的表生成器
+            -DLLVM_TABLEGEN="${HOST_BUILD_DIR}/bin/llvm-tblgen" \
+            -DCLANG_TABLEGEN="${HOST_BUILD_DIR}/bin/clang-tblgen" \
+            -DLLVM_CONFIG_PATH="${HOST_BUILD_DIR}/bin/llvm-config"
 
           cmake --build "${TARGET_BUILD_DIR}" --target install -j$(nproc)
 
       - name: Check
         run: |
           if [ -d "llvm-${{matrix.target}}" ]; then
+            echo "=== Binaries ==="
             file llvm-${{matrix.target}}/bin/* || true
             echo "=== Library directories ==="
             ls -la llvm-${{matrix.target}}/lib* || true
             echo "=== Install directory structure ==="
-            tree llvm-${{matrix.target}} || true
+            tree -L 2 llvm-${{matrix.target}} || true
           else
             echo "Build directory not found, checking build directory..."
             ls -la build/
@@ -309,7 +344,7 @@ jobs:
       - name: Compress
         run: |
           if [ -d "llvm-${{matrix.target}}" ]; then
-            projects=$(echo "clang+clang-tools-extra+lld")
+            projects="clang+clang-tools-extra+lld"
             tarball_name=${projects}-r${{inputs.version}}${{inputs.revision}}-${{matrix.target}}
             echo tarball_name=${tarball_name} >> ${GITHUB_ENV}
             mv llvm-${{matrix.target}} ${tarball_name}
